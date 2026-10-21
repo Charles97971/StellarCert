@@ -12,6 +12,7 @@ describe('CertificateTransferService', () => {
   let logger: any;
   let userRepo: any;
   let emailService: any;
+  let feeCharger: any;
 
   beforeEach(() => {
     transferRepo = {
@@ -26,11 +27,11 @@ describe('CertificateTransferService', () => {
     };
 
     auditService = {
-      log: jest.fn().mockResolvedValue(undefined),
+      log: jest.fn().mockResolved(undefined),
     };
 
     notificationsService = {
-      createNotification: jest.fn().mockResolvedValue({ id: 'notif-1' }),
+      createNotification: jest.fn().mockResolved({ id: 'notif-1' }),
     };
 
     logger = {
@@ -44,8 +45,14 @@ describe('CertificateTransferService', () => {
     };
 
     emailService = {
-      sendTransferConfirmationCode: jest.fn().mockResolvedValue(undefined),
-      sendTransferCompletedNotice: jest.fn().mockResolvedValue(undefined),
+      sendTransferConfirmationCode: jest.fn().mockResolved(undefined),
+      sendTransferCompletedNotice: jest.fn().mockResolved(undefined),
+    };
+
+    feeCharger = {
+      chargeTransferFee: jest
+        .fn()
+        .mockResolved({ transactionHash: 'tx-hash-1' }),
     };
 
     service = new CertificateTransferService(
@@ -56,6 +63,7 @@ describe('CertificateTransferService', () => {
       logger,
       userRepo,
       emailService,
+      feeCharger,
     );
   });
 
@@ -69,7 +77,7 @@ describe('CertificateTransferService', () => {
         recipientName: 'Old Owner',
         status: 'active',
       };
-      certRepo.findOne.mockResolvedValue(mockCert);
+      certRepo.findOne.mockResolved(mockCert);
 
       const recipientUser = {
         id: 'user-recipient-99',
@@ -77,7 +85,7 @@ describe('CertificateTransferService', () => {
         firstName: 'New',
         lastName: 'Owner',
       };
-      userRepo.findOne.mockResolvedValue(recipientUser);
+      userRepo.findOne.mockResolved(recipientUser);
 
       const dto = {
         certificateId: 'cert-1',
@@ -133,6 +141,7 @@ describe('CertificateTransferService', () => {
         toEmail: 'newowner@example.com',
         toName: 'New Owner',
         confirmationCode: '123456',
+        transferFee: '0',
         status: TransferStatus.PENDING,
         certificate: {
           id: 'cert-1',
@@ -145,15 +154,15 @@ describe('CertificateTransferService', () => {
         },
       };
 
-      transferRepo.findOne.mockResolvedValue(mockTransfer);
-      certRepo.findOne.mockResolvedValue(mockTransfer.certificate);
+      transferRepo.findOne.mockResolved(mockTransfer);
+      certRepo.findOne.mockResolved(mockTransfer.certificate);
 
       const recipientUser = {
         id: 'user-recipient-99',
         email: 'newowner@example.com',
         firstName: 'New',
       };
-      userRepo.findOne.mockResolvedValue(recipientUser);
+      userRepo.findOne.mockResolved(recipientUser);
 
       await service.approveTransfer(
         'transfer-1',
@@ -185,6 +194,195 @@ describe('CertificateTransferService', () => {
         certificateTitle: 'Blockchain Certified Developer',
         certificateId: 'cert-1',
       });
+    });
+
+    it('charges the transfer fee via SAC token transfer when transfer_fee > 0', async () => {
+      const mockTransfer = {
+        id: 'transfer-1',
+        certificateId: 'cert-1',
+        fromEmail: 'old@example.com',
+        fromName: 'Old Owner',
+        toEmail: 'newowner@example.com',
+        toName: 'New Owner',
+        confirmationCode: '123456',
+        transferFee: '250',
+        initiatedBy: 'payer-1',
+        status: TransferStatus.PENDING,
+        certificate: {
+          id: 'cert-1',
+          title: 'Blockchain Certified Developer',
+          issuerId: 'issuer-1',
+          recipientEmail: 'old@example.com',
+          recipientName: 'Old Owner',
+          status: 'active',
+          metadata: {},
+          issuerWalletAddress: 'GRECIPIENT-ADDRESS',
+        },
+      };
+
+      transferRepo.findOne.mockResolved(mockTransfer);
+      certRepo.findOne.mockResolved(mockTransfer.certificate);
+      userRepo.findOne.mockResolved({
+        id: 'payer-1',
+        walletAddress: 'GPAYER-ADDRESS',
+      });
+
+      await service.approveTransfer(
+        'transfer-1',
+        '123456',
+        { id: 'approver-1', role: UserRole.ADMIN },
+        '127.0.0.1',
+      );
+
+      expect(feeCharger.chargeTransferFee).toHaveBeenCalledTimes(1);
+      expect(feeCharger.chargeTransferFee).toHaveBeenCalledWith(
+        expect.objectContaining({
+          transferId: 'transfer-1',
+          feeAmount: BigInt(250),
+          payerId: 'payer-1',
+          payerAddress: 'GPAYER-ADDRESS',
+          recipientAddress: 'GRECIPIENT-ADDRESS',
+        }),
+      );
+      expect(mockTransfer.feePaid).toBe(true);
+      expect(mockTransfer.feeTransactionHash).toBe('tx-hash-1');
+    });
+
+    it('does not charge a fee when transfer_fee is zero', async () => {
+      const mockTransfer = {
+        id: 'transfer-1',
+        certificateId: 'cert-1',
+        fromEmail: 'old@example.com',
+        fromName: 'Old Owner',
+        toEmail: 'newowner@example.com',
+        toName: 'New Owner',
+        confirmationCode: '123456',
+        transferFee: '0',
+        status: TransferStatus.PENDING,
+        certificate: {
+          id: 'cert-1',
+          title: 'Blockchain Certified Developer',
+          issuerId: 'issuer-1',
+          recipientEmail: 'old@example.com',
+          recipientName: 'Old Owner',
+          status: 'active',
+          metadata: {},
+        },
+      };
+
+      transferRepo.findOne.mockResolved(mockTransfer);
+      certRepo.findOne.mockResolved(mockTransfer.certificate);
+      userRepo.findOne.mockResolved(null);
+
+      await service.approveTransfer(
+        'transfer-1',
+        '123456',
+        { id: 'approver-1', role: UserRole.ADMIN },
+        '127.0.0.1',
+      );
+
+      expect(feeCharger.chargeTransferFee).not.toHaveBeenCalled();
+    });
+
+    it('does not complete the transfer when the fee transfer fails', async () => {
+      const mockTransfer = {
+        id: 'transfer-1',
+        certificateId: 'cert-1',
+        fromEmail: 'old@example.com',
+        fromName: 'Old Owner',
+        toEmail: 'newowner@example.com',
+        toName: 'New Owner',
+        confirmationCode: '123456',
+        transferFee: '250',
+        initiatedBy: 'payer-1',
+        status: TransferStatus.PENDING,
+        certificate: {
+          id: 'cert-1',
+          title: 'Blockchain Certified Developer',
+          issuerId: 'issuer-1',
+          recipientEmail: 'old@example.com',
+          recipientName: 'Old Owner',
+          status: 'active',
+          metadata: {},
+          issuerWalletAddress: 'GRECIPIENT-ADDRESS',
+        },
+      };
+
+      transferRepo.findOne.mockResolved(mockTransfer);
+      certRepo.findOne.mockResolved(mockTransfer.certificate);
+      userRepo.findOne.mockResolved({
+        id: 'payer-1',
+        walletAddress: 'GPAYER-ADDRESS',
+      });
+      feeCharger.chargeTransferFee.mockRejected(
+        new Error('insufficient balance'),
+      );
+
+      await expect(
+        service.approveTransfer(
+          'transfer-1',
+          '123456',
+          { id: 'approver-1', role: UserRole.ADMIN },
+          '127.0.0.1',
+        ),
+      ).rejects.toThrow('insufficient balance');
+
+      expect(certRepo.save).not.toHaveBeenCalled();
+      expect(transferRepo.save).not.toHaveBeenCalledWith(
+        expect.objectContaining({ status: TransferStatus.APPROVED }),
+      );
+    });
+
+    it('throws when fee is required but no fee charger is configured', async () => {
+      const serviceWithoutCharger = new CertificateTransferService(
+        transferRepo,
+        certRepo,
+        auditService,
+        notificationsService,
+        logger,
+        userRepo,
+        emailService,
+        undefined,
+      );
+
+      const mockTransfer = {
+        id: 'transfer-1',
+        certificateId: 'cert-1',
+        fromEmail: 'old@example.com',
+        fromName: 'Old Owner',
+        toEmail: 'newowner@example.com',
+        toName: 'New Owner',
+        confirmationCode: '123456',
+        transferFee: '250',
+        initiatedBy: 'payer-1',
+        status: TransferStatus.PENDING,
+        certificate: {
+          id: 'cert-1',
+          title: 'Blockchain Certified Developer',
+          issuerId: 'issuer-1',
+          recipientEmail: 'old@example.com',
+          recipientName: 'Old Owner',
+          status: 'active',
+          metadata: {},
+          issuerWalletAddress: 'GRECIPIENT-ADDRESS',
+        },
+      };
+
+      transferRepo.findOne.mockResolved(mockTransfer);
+      certRepo.findOne.mockResolved(mockTransfer.certificate);
+      userRepo.findOne.mockResolved({
+        id: 'payer-1',
+        walletAddress: 'GPAYER-ADDRESS',
+      });
+
+      await expect(
+        serviceWithoutCharger.approveTransfer(
+          'transfer-1',
+          '123456',
+          { id: 'approver-1', role: UserRole.ADMIN },
+          '127.0.0.1',
+        ),
+      ).rejects.toThrow('no fee charger is configured');
     });
   });
 });

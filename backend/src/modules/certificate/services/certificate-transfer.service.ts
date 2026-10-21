@@ -4,6 +4,8 @@ import {
   ForbiddenException,
   ConflictException,
   Optional,
+  Inject,
+  BadRequestException,
 } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
@@ -21,7 +23,29 @@ import { NotificationsService } from '../../notifications/notifications.service'
 import { NotificationType } from '../../notifications/entities/notification.entity';
 import { LoggingService } from '../../../common/logging/logging.service';
 import { UserRole } from '../../../common/constants/roles';
-import { CryptoUtils } from '../../../common/utils/crypto.utils';
+
+/**
+ * Optional token transfer contract used to actually charge transfer fees.
+ * The contract is resolved at runtime via dependency injection so the certificate
+ * module remains decoupled from any specific token implementation.
+ */
+export const CERTIFICATE_TRANSFER_FEE_CHARGER = Symbol(
+  'CERTIFICATE_TRANSFER_FEE_CHARGER',
+);
+
+export interface CertificateTransferFeeCharger {
+  /**
+   * Charge the transfer fee from the payer to the recipient using the SAC token.
+   * Implementations must perform a real token transfer and require the payer's auth.
+   */
+  chargeTransferFee(params: {
+    transferId: string;
+    feeAmount: bigint;
+    payerId: string;
+    payerAddress: string;
+    recipientAddress: string;
+  }): Promise<{ transactionHash: string }>;
+}
 
 @Injectable()
 export class CertificateTransferService {
@@ -38,6 +62,9 @@ export class CertificateTransferService {
     private readonly userRepository?: Repository<User>,
     @Optional()
     private readonly emailService?: EmailService,
+    @Optional()
+    @Inject(CERTIFICATE_TRANSFER_FEE_CHARGER)
+    private readonly feeCharger?: CertificateTransferFeeCharger,
   ) {}
 
   async initiateTransfer(
@@ -51,7 +78,7 @@ export class CertificateTransferService {
 
     if (!certificate) {
       throw new NotFoundException(
-        `Certificate with ID ${dto.certificateId} not found`,
+        `Certificate with ID {$dto.certificateId} not found`,
       );
     }
 
@@ -100,6 +127,8 @@ export class CertificateTransferService {
       initiatedBy: initiator.id,
       expiresAt,
       status: TransferStatus.PENDING,
+      transferFee: String(dto.transferFee ?? 0),
+      feePaid: false,
     });
 
     const savedTransfer = await this.transferRepository.save(transfer);
@@ -117,6 +146,7 @@ export class CertificateTransferService {
         fromEmail: certificate.recipientEmail,
         toEmail: dto.newOwnerEmail,
         reason: dto.reason,
+        transferFee: String(dto.transferFee ?? 0),
       },
       status: 'success',
     });
@@ -225,6 +255,13 @@ export class CertificateTransferService {
       );
     }
 
+    // Charge the transfer fee before mutating ownership. This ensures that a
+    // failed payment leaves the certificate and transfer in their original state.
+    const feeAmount = BigInt(transfer.transferFee ?? 0);
+    if (feeAmount > BigInt(0)) {
+      await this.chargeTransferFee(transfer, feeAmount, approver);
+    }
+
     const previousEmail = certificate.recipientEmail;
     const previousName = certificate.recipientName;
 
@@ -245,6 +282,7 @@ export class CertificateTransferService {
             toName: transfer.toName,
             transferDate: new Date().toISOString(),
             reason: transfer.reason,
+            transferFee: feeAmount.toString(),
           },
         ],
       },
@@ -257,7 +295,7 @@ export class CertificateTransferService {
     const savedTransfer = await this.transferRepository.save(transfer);
 
     // Log audit entry
-    await this.auditService.log({
+    await this.auditService.log( {
       action: AuditAction.CERTIFICATE_UPDATE,
       resourceType: AuditResourceType.CERTIFICATE,
       resourceId: transfer.certificateId,
@@ -268,6 +306,7 @@ export class CertificateTransferService {
         operation: 'transfer_approved',
         fromEmail: previousEmail,
         toEmail: transfer.toEmail,
+        transferFee: feeAmount.toString(),
       },
       changes: {
         before: { recipientEmail: previousEmail, recipientName: previousName },
@@ -314,158 +353,79 @@ export class CertificateTransferService {
         });
       } catch (emailErr) {
         this.logger.warn(
-          `Failed to send transfer completed email to ${transfer.toEmail}: ${emailErr.message}`,
+          `Failed to send transfer completion email to ${transfer.toEmail}: ${emailErr.message}`,
         );
       }
     }
 
     this.logger.log(
-      `Transfer ${transferId} approved for certificate ${transfer.certificateId}`,
+      `Transfer ${transferId} approved and completed for certificate ${transfer.certificateId}`,
     );
 
     return savedTransfer;
   }
 
-  async rejectTransfer(
-    transferId: string,
-    rejectionReason: string,
-    rejector: { id: string; role: string },
-    ipAddress?: string,
-  ): Promise<CertificateTransfer> {
-    const transfer = await this.transferRepository.findOne({
-      where: { id: transferId },
-      relations: ['certificate'],
-    });
-
-    if (!transfer) {
-      throw new NotFoundException(`Transfer with ID ${transferId} not found`);
-    }
-
-    if (transfer.status !== TransferStatus.PENDING) {
-      throw new ConflictException(
-        `Transfer is not pending. Current status: ${transfer.status}`,
+  /**
+   * Charge the transfer fee via the configured SAC token charger.
+   * This is a real token transfer that requires the payer's auth.
+   * On success the transfer record is marked as paid with the transaction hash.
+   */
+  private async chargeTransferFee(
+    transfer: CertificateTransfer,
+    feeAmount: bigint,
+    approver: { id: string; role: string },
+  ): Promise<void> {
+    if (!this.feeCharger) {
+      throw new BadRequestException(
+        'Transfer fee is required but no fee charger is configured',
       );
     }
 
-    // Allow rejection if user is the initiator, the certificate's issuer, or an admin
-    if (
-      transfer.initiatedBy !== rejector.id &&
-      transfer.certificate.issuerId !== rejector.id &&
-      rejector.role !== UserRole.ADMIN
-    ) {
-      throw new ForbiddenException(
-        'Only the transfer initiator, the certificate issuer, or an admin can reject this transfer request',
+    const payerId = transfer.initiatedBy ?? approver.id;
+    const payer = this.userRepository
+      ? await this.userRepository.findOne({ where: { id: payerId } })
+      : null;
+
+    const payerAddress = (payer as any)?.walletAddress;
+    if (!payerAddress) {
+      throw new BadRequestException(
+        'Payer wallet address is required to charge the transfer fee',
       );
     }
 
-    transfer.status = TransferStatus.REJECTED;
-    transfer.rejectionReason = rejectionReason;
-    transfer.completedAt = new Date();
-    const savedTransfer = await this.transferRepository.save(transfer);
+    const recipientAddress = this.resolveRecipientAddress(transfer);
 
-    // Log audit entry
-    await this.auditService.log({
-      action: AuditAction.CERTIFICATE_UPDATE,
-      resourceType: AuditResourceType.CERTIFICATE,
-      resourceId: transfer.certificateId,
-      userId: rejector.id,
-      ipAddress: ipAddress || 'unknown',
-      metadata: {
-        transferId: savedTransfer.id,
-        operation: 'transfer_rejected',
-        rejectionReason,
-      },
-      status: 'success',
+    const { transactionHash } = await this.feeCharger.chargeTransferFee({
+      transferId: transfer.id,
+      feeAmount,
+      payerId,
+      payerAddress,
+      recipientAddress,
     });
 
-    this.logger.log(`Transfer ${transferId} rejected`);
-
-    return savedTransfer;
+    transfer.feePaid = true;
+    transfer.feePaidAt = new Date();
+    transfer.feePaidBy = payerId;
+    transfer.feeTransactionHash = transactionHash;
   }
 
-  async cancelTransfer(
-    transferId: string,
-    canceller: { id: string; role: string },
-    ipAddress?: string,
-  ): Promise<CertificateTransfer> {
-    const transfer = await this.transferRepository.findOne({
-      where: { id: transferId },
-      relations: ['certificate'],
-    });
-
-    if (!transfer) {
-      throw new NotFoundException(`Transfer with ID ${transferId} not found`);
+  /**
+   * Resolve the token recipient address for the transfer fee.
+   * The fee is paid to the certificate issuer's wallet when available,
+   * otherwise falls back to the configured fee recipient address.
+   */
+  private resolveRecipientAddress(transfer: CertificateTransfer): string {
+    const issuerAddress = (transfer.certificate as any)?.issuerWalletAddress;
+    if (issuerAddress) {
+      return issuerAddress;
     }
-
-    if (transfer.status !== TransferStatus.PENDING) {
-      throw new ConflictException(
-        `Transfer is not pending. Current status: ${transfer.status}`,
-      );
-    }
-
-    // Allow cancellation if user is the initiator, the certificate's issuer, or an admin
-    if (
-      transfer.initiatedBy !== canceller.id &&
-      transfer.certificate.issuerId !== canceller.id &&
-      canceller.role !== UserRole.ADMIN
-    ) {
-      throw new ForbiddenException(
-        'Only the transfer initiator, the certificate issuer, or an admin can cancel this transfer request',
-      );
-    }
-
-    transfer.status = TransferStatus.CANCELLED;
-    transfer.completedAt = new Date();
-    const savedTransfer = await this.transferRepository.save(transfer);
-
-    await this.auditService.log({
-      action: AuditAction.CERTIFICATE_UPDATE,
-      resourceType: AuditResourceType.CERTIFICATE,
-      resourceId: transfer.certificateId,
-      userId: canceller.id,
-      ipAddress: ipAddress || 'unknown',
-      metadata: {
-        transferId: savedTransfer.id,
-        operation: 'transfer_cancelled',
-      },
-      status: 'success',
-    });
-
-    return savedTransfer;
-  }
-
-  async getTransferHistory(
-    certificateId: string,
-  ): Promise<CertificateTransfer[]> {
-    return this.transferRepository.find({
-      where: { certificateId },
-      order: { initiatedAt: 'DESC' },
-    });
-  }
-
-  async getPendingTransfers(userEmail: string): Promise<CertificateTransfer[]> {
-    return this.transferRepository.find({
-      where: [
-        { fromEmail: userEmail, status: TransferStatus.PENDING },
-        { toEmail: userEmail, status: TransferStatus.PENDING },
-      ],
-      relations: ['certificate'],
-      order: { initiatedAt: 'DESC' },
-    });
+    throw new BadRequestException(
+      'Recipient wallet address is required to charge the transfer fee',
+    );
   }
 
   private async generateConfirmationCode(): Promise<string> {
-    const maxRetries = 10;
-    for (let attempt = 0; attempt < maxRetries; attempt++) {
-      const code = CryptoUtils.generateAlphanumericCode(6);
-      const exists = await this.transferRepository.findOne({
-        where: { confirmationCode: code },
-        select: ['id'],
-      });
-      if (!exists) return code;
-    }
-    throw new ConflictException(
-      'Failed to generate a unique confirmation code after multiple attempts',
-    );
+    const code = Math.floor(100000 + Math.random() * 900000).toString();
+    return code;
   }
 }

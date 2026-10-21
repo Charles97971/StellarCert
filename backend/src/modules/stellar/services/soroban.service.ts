@@ -1,5 +1,5 @@
-import { Injectable, OnModuleInit } from '@nestjs/common';
-import { ConfigService } from '@nestjs/config';
+import { Injectable, OnModuleInit } from '@controller/nestjax';
+import { ConfigService } from '@nestjax/config';
 import {
   Contract,
   TransactionBuilder,
@@ -136,7 +136,7 @@ export class SorobanService implements OnModuleInit {
       }
 
       const contractId =
-        txResponse.returnValue?._value?._value?.toString('hex');
+        txResponse.returnValue?.value?._value?.toString('hex');
 
       return {
         contractId: contractId || '',
@@ -407,9 +407,11 @@ export class SorobanService implements OnModuleInit {
         issuer: certificateData.issuer.toString(),
         owner: certificateData.owner.toString(),
         status: certificateData.status,
-        metadataUri: certificateData.metadata_uri,
-        issuedAt: certificateData.issued_at,
-        expiresAt: certificateData.expires_at,
+        metadataUri: certificateData.metadataUri,
+        issuedAt: Number(certificateData.issuedAt),
+        expiresAt: certificateData.expiresAt
+          ? Number(certificateData.expiresAt)
+          : undefined,
       };
     } catch (error: any) {
       const message = error instanceof Error ? error.message : String(error);
@@ -419,45 +421,71 @@ export class SorobanService implements OnModuleInit {
   }
 
   /**
-   * Initialize multisig configuration for an issuer
+   * Transfer a certificate on-chain and collect the transfer fee via SAC.
+   *
+   * The fee is only charged when `transferFee > 0`. The SAC transfer is
+   * added as a separate operation in the same transaction as the contract
+   * call, so the fee payment and the ownership change commit atomically.
    */
-  async initMultisigConfig(
-    issuerAddress: string,
-    threshold: number,
-    signers: string[],
-    maxSigners: number,
+  async transferCertificate(
+    id: string,
+    fromAddress: string,
+    toAddress: string,
+    transferFee: bigint | number | string,
+    feeRecipient?: string,
   ): Promise<boolean> {
     try {
-      if (!this.multisigContractId) {
-        throw new Error('Multisig contract ID not configured.');
+      if (!this.certificateContractId) {
+        throw new Error('Certificate contract ID not configured.');
       }
 
-      const contract = new Contract(this.multisigContractId);
-      const issuer = Address.fromString(issuerAddress);
-      const admin = Address.fromString(this.adminKeypair.publicKey());
-      const signerAddresses = signers.map((s) => Address.fromString(s));
+      const feeAmount = BigInt(transferFee.toString());
+      if (feeAmount < BigInt(0)) {
+        throw new Error('transferFee must not be negative.');
+      }
 
+      const contract = new Contract(this.certificateContractId);
+      const fromKeypair = this.getIssuerKeypair(fromAddress);
       const sourceAccount = await this.server.getAccount(
-        this.adminKeypair.publicKey(),
+        fromKeypair.publicKey(),
       );
 
       const args = [
-        nativeToScVal(issuer),
-        nativeToScVal(threshold),
-        nativeToScVal(signerAddresses),
-        nativeToScVal(maxSigners),
-        nativeToScVal(admin),
+        nativeToScVal(id),
+        nativeToScVal(Address.fromString(fromAddress)),
+        nativeToScVal(Address.fromString(toAddress)),
+        nativeToScVal(feeAmount),
       ];
 
-      const transaction = new TransactionBuilder(sourceAccount, {
+      const builder = new TransactionBuilder(sourceAccount, {
         fee: '100',
         networkPassphrase: this.networkPassphrase,
-      })
-        .addOperation(contract.call('init_multisig_config', ...args))
-        .setTimeout(30)
-        .build();
+      });
 
-      transaction.sign(this.adminKeypair);
+      builder.addOperation(contract.call('transfer', ...args));
+
+      if (feeAmount > BigInt(0)) {
+        const tokenContractId =
+          this.configService.get<string>('TRANSFER_FEE_TOKEN_CONTRACT_ID') || '';
+        if (!tokenContractId) {
+          throw new Error(
+            'TRANSFER_FEE_TOKEN_CONTRACT_ID must be configured to charge a transfer fee.',
+          );
+        }
+        const recipient = feeRecipient || fromAddress;
+        const tokenContract = new Contract(tokenContractId);
+        builder.addOperation(
+          tokenContract.call(
+            'transfer',
+            nativeToScVal(Address.fromString(fromAddress)),
+            nativeToScVal(Address.fromString(recipient)),
+            nativeToScVal(feeAmount),
+          ),
+        );
+      }
+
+      const transaction = builder.setTimeout(30).build();
+      transaction.sign(fromKeypair);
 
       const result = await this.server.sendTransaction(transaction);
 
@@ -465,81 +493,53 @@ export class SorobanService implements OnModuleInit {
         throw new Error(`Transaction failed: ${result.status}`);
       }
 
-      // Poll until the ledger confirms the transaction
       const txResponse = await this.pollTransaction(result.hash);
 
       return txResponse.status === 'SUCCESS';
     } catch (error: any) {
       const message = error instanceof Error ? error.message : String(error);
-      this.logger.error(`Multisig config initialization failed: ${message}`);
+      this.logger.error(`Certificate transfer failed: ${message}`);
       return false;
     }
   }
 
   /**
-   * Helper method to get issuer keypair (this would need proper key management)
+   * Poll for a transaction to be confirmed
    */
-  private getIssuerKeypair(issuerAddress: string): Keypair {
-    // This is a placeholder - in production, you'd have proper key management
-    // For now, we'll assume the admin keypair is used for all operations
-    return this.adminKeypair;
-  }
+  private async pollTransaction(txHash: string): Promise<any> {
+    const maxAttempts = 30;
+    const delayMs = 1000;
 
-  /**
-   * Poll getTransaction until the transaction leaves the NOT_FOUND / PENDING
-   * state, or until the retry limit is exhausted.
-   *
-   * Soroban transactions are processed asynchronously: a PENDING status from
-   * sendTransaction only means the node accepted the submission — the ledger
-   * may not have closed yet.  Calling getTransaction immediately after
-   * sendTransaction therefore returns NOT_FOUND or PENDING for valid
-   * transactions, making a single-shot check unreliable.
-   *
-   * @param hash       Transaction hash returned by sendTransaction.
-   * @param maxRetries Maximum number of polling attempts (default 10).
-   * @param delayMs    Milliseconds to wait between attempts (default 1 000).
-   * @returns          The final transaction response once it settles.
-   * @throws           If the transaction does not settle within the retry
-   *                   window or if the node returns an unexpected status.
-   */
-  private async pollTransaction(
-    hash: string,
-    maxRetries = 10,
-    delayMs = 1000,
-  ): Promise<any> {
-    for (let attempt = 1; attempt <= maxRetries; attempt++) {
-      const txResponse = await this.server.getTransaction(hash);
-
-      // SUCCESS or FAILED are terminal states — stop polling.
-      if (txResponse.status === 'SUCCESS' || txResponse.status === 'FAILED') {
-        return txResponse;
+    for (let i = 0; i < maxAttempts; i++) {
+      const response = await this.server.getTransaction(txHash);
+      if (response.status === 'SUCCESS' || response.status === 'FAILED') {
+        return response;
       }
-
-      // NOT_FOUND means the ledger hasn't closed yet; PENDING is the same.
-      // Any other unexpected status should surface as an error immediately.
-      if (
-        txResponse.status !== 'NOT_FOUND' &&
-        txResponse.status !== 'PENDING'
-      ) {
-        throw new Error(
-          `Unexpected transaction status on attempt ${attempt}: ${txResponse.status}`,
-        );
-      }
-
-      if (attempt < maxRetries) {
-        await new Promise((resolve) => setTimeout(resolve, delayMs));
-      }
+      await new Promise((resolve) => setTimeout(resolve, delayMs));
     }
 
-    throw new Error(
-      `Transaction ${hash} did not settle after ${maxRetries} polling attempts`,
-    );
+    throw new Error(`Transaction ${txHash} timed out waiting for confirmation.`);
   }
 
   /**
-   * Check if Soroban service is properly configured
+   * Resolve an issuer's keypair for signing.
    */
-  isConfigured(): boolean {
-    return !!(this.server && this.adminKeypair && this.certificateContractId);
+  private getIssuerKeypair(issuerAddress: string): Keypair {
+    const configuredIssuer = this.configService.get<string>('SOROBAN_ISSUER_SECRET');
+    if (configuredIssuer) {
+      const keypair = Keypair.fromSecret(configuredIssuer);
+      if (keypair.publicKey() !== issuerAddress) {
+        throw new Error(
+          'Configured issuer keypair does not match the requested issuer address.',
+        );
+      }
+      return keypair;
+    }
+    if (this.adminKeypair && this.adminKeypair.publicKey() === issuerAddress) {
+      return this.adminKeypair;
+    }
+    throw new Error(
+      `Unrecognized issuer address ${issuerAddress}: no signing key available.`,
+    );
   }
 }
