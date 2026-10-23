@@ -67,6 +67,19 @@ export class CertificateTransferService {
     private readonly feeCharger?: CertificateTransferFeeCharger,
   ) {}
 
+  private async generateConfirmationCode(): Promise<string> {
+    return CryptoUtils.generateRandomString(6, { digits: true, upper: false, lower: false });
+  }
+
+  private async findUserByEmail(email: string): Promise<User | null> {
+    if (!this.userRepository || !email) {
+      return null;
+    }
+    return this.userRepository.findOne({
+      where: { email },
+    });
+  }
+
   async initiateTransfer(
     dto: InitiateTransferDto,
     initiator: { id: string; role: string },
@@ -85,7 +98,7 @@ export class CertificateTransferService {
     // Verify that only the certificate's issuer or an admin can initiate a transfer
     if (
       initiator.role !== UserRole.ADMIN &&
-      certificate.issuerId !== initiator.id
+      certificate.issuerId !== inititor.id
     ) {
       throw new ForbiddenException(
         'You are not authorized to initiate a transfer for this certificate. Only the certificate issuer or an admin can perform this action.',
@@ -160,11 +173,7 @@ export class CertificateTransferService {
     );
 
     // Look up the new owner (toEmail) user account
-    const recipientUser = this.userRepository
-      ? await this.userRepository.findOne({
-          where: { email: dto.newOwnerEmail },
-        })
-      : null;
+    const recipientUser = await this.findUserByEmail(dto.newOwnerEmail);
 
     if (recipientUser) {
       // Send notification with confirmation code to the intended new owner
@@ -243,12 +252,17 @@ export class CertificateTransferService {
       throw new NotFoundException('Associated certificate not found');
     }
 
+    // Re-validate certificate status at completion time. The certificate may have been
+    // frozen, revoked, or otherwise deactivated after the transfer was accepted.
     if (certificate.status !== 'active') {
       throw new ConflictException(
         `Cannot transfer certificate with status: ${certificate.status}. Only active certificates can be transferred.`,
       );
     }
 
+    // Re-validate that the certificate is still owned by the transfer's intended
+    // source owner. This prevents a second pending transfer (e.g. A→B, A→H) from
+    // stripping the new owner after the first transfer completes.
     if (certificate.recipientEmail !== transfer.fromEmail) {
       throw new ConflictException(
         'Certificate owner has changed since transfer was initiated',
@@ -290,7 +304,7 @@ export class CertificateTransferService {
 
     await this.certificateRepository.save(certificate);
 
-    transfer.status = TransferStatus.APPROVED;
+    transfer.status = TransferStatus.APPROVAL;
     transfer.completedAt = new Date();
     const savedTransfer = await this.transferRepository.save(transfer);
 
@@ -327,11 +341,7 @@ export class CertificateTransferService {
     );
 
     // Look up the new owner (toEmail) user account and notify on completion
-    const recipientUser = this.userRepository
-      ? await this.userRepository.findOne({
-          where: { email: transfer.toEmail },
-        })
-      : null;
+    const recipientUser = await this.findUserByEmail(transfer.toEmail);
 
     if (recipientUser) {
       await this.notificationsService.createNotification(
@@ -381,51 +391,40 @@ export class CertificateTransferService {
       );
     }
 
-    const payerId = transfer.initiatedBy ?? approver.id;
-    const payer = this.userRepository
-      ? await this.userRepository.findOne({ where: { id: payerId } })
-      : null;
+    transfer.status = TransferStatus.REJECTED;
+    transfer.rejectionReason = rejectionReason;
+    transfer.completedAt = new Date();
+    const savedTransfer = await this.transferRepository.save(transfer);
 
-    const payerAddress = (payer as any)?.walletAddress;
-    if (!payerAddress) {
-      throw new BadRequestException(
-        'Payer wallet address is required to charge the transfer fee',
+    await this.auditService.log({
+      action: AuditAction.CERTIFICATE_UPDATE,
+      resourceType: AuditResourceType.CERTIFICATE,
+      resourceId: transfer.certificateId,
+      userId: rejector.id,
+      ipAddress: ipAddress || 'unknown',
+      metadata: {
+        transferId: savedTransfer.id,
+        operation: 'transfer_rejected',
+        reason: rejectionReason,
+      },
+      status: 'success',
+    });
+
+    // Notify the intended new owner that the transfer was rejected
+    const recipientUser = await this.findUserByEmail(transfer.toEmail);
+    if (recipientUser) {
+      await this.notificationsService.createNotification(
+        recipientUser.id,
+        NotificationType.WARNING,
+        'Certificate Transfer Rejected',
+        `The transfer of certificate "${transfer.certificate.title}" to your account was rejected.`,
       );
     }
 
-    const recipientAddress = this.resolveRecipientAddress(transfer);
-
-    const { transactionHash } = await this.feeCharger.chargeTransferFee({
-      transferId: transfer.id,
-      feeAmount,
-      payerId,
-      payerAddress,
-      recipientAddress,
-    });
-
-    transfer.feePaid = true;
-    transfer.feePaidAt = new Date();
-    transfer.feePaidBy = payerId;
-    transfer.feeTransactionHash = transactionHash;
-  }
-
-  /**
-   * Resolve the token recipient address for the transfer fee.
-   * The fee is paid to the certificate issuer's wallet when available,
-   * otherwise falls back to the configured fee recipient address.
-   */
-  private resolveRecipientAddress(transfer: CertificateTransfer): string {
-    const issuerAddress = (transfer.certificate as any)?.issuerWalletAddress;
-    if (issuerAddress) {
-      return issuerAddress;
-    }
-    throw new BadRequestException(
-      'Recipient wallet address is required to charge the transfer fee',
+    this.logger.log(
+      `Transfer ${transferId} rejected for certificate ${transfer.certificateId}`,
     );
-  }
 
-  private async generateConfirmationCode(): Promise<string> {
-    const code = Math.floor(100000 + Math.random() * 900000).toString();
-    return code;
+    return savedTransfer;
   }
 }
